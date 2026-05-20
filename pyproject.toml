@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlas-pdata-debugger"
+version = "0.1.0"
+description = "Debug tool for Atlas protocol pData simulation failures"
+requires-python = ">=3.10"
+
+[project.scripts]
+atlas-debug = "atlas_debugger.cli:main"
