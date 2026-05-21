@@ -1,14 +1,14 @@
 # Atlas pData Debugger
 
+> **NOTE:** This repo represents an educational example to use a Chainlink system, product, or service and is provided to demonstrate how to interact with Chainlink’s systems, products, and services to integrate them into your own. This template is provided “AS IS” and “AS AVAILABLE” without warranties of any kind, it has not been audited, and it may be missing key checks or error handling to make the usage of the system, product or service more clear. Do not use the code in this example in a production environment without completing your own audits and application of best practices. Neither Chainlink Labs, the Chainlink Foundation, nor Chainlink node operators are responsible for unintended outputs that are generated due to errors in code.
+
 A CLI tool to help Atlas protocol searchers diagnose `simSolverCall` simulation failures.
 
 Given a pData hex file, this tool can:
-- **Parse** all fields (UserOp, SolverOp, DAppOp), the embedded Chainlink OCR `transmit` report (every observation + median), and the underlying base feed (e.g. `BTC / USD`).
+- **Parse** basic decoded fields (UserOp / SolverOp / DAppOp / Oracle basics) with no RPC-dependent block lookup.
 - **Find the on-chain landed metacall tx** for the auction (works even when a different solver won the bid).
-- **Generate** a standalone Foundry test (`test/<pdata_name>.t.sol`) at the right fork block, with all known addresses pre-labeled via `vm.label` so the trace shows readable names (`[Atlas]`, `[Solver]`, `[ChainlinkAtlasWrapper]`, `[BTC / USD Feed]`, …).
-- **(opt-in) Run `forge test -vvvv` automatically** and produce two artifacts in `out/`:
-  - a clean (ANSI-stripped) `<pdata_name>.trace.log`,
-  - an AI-ready `<pdata_name>.prompt.md` with Atlas protocol context, **chain-specific config** (per Arbitrum / Base / Ethereum / BSC, with the right block-explorer URLs and quirks), parsed pData summary, decoded `simResult`/`outcome`, source-code links, and a checklist of questions for the AI to answer.
+- **Generate** a standalone Foundry test (`test/<pdata_name>.t.sol`) at the right fork block, with all known addresses pre-labeled via `vm.label`.
+- **Sweep execution across blocks** (in `sweep`) to find pass/fail boundaries before choosing a detailed replay block.
 
 ## Requirements
 
@@ -23,113 +23,76 @@ Get the pData for your simulation. See how to query a bid
 If you hit a "solverop not found" issue, use the
 [test bot](https://github.com/QingyangKong/test-bot) to verify the if way you send your request is correct.
 
-Save your `pData.txt` in this directory, then pick the workflow that matches
-how much manual control you want over the fork block:
-
-### Mode A — One-shot
-
-Let `--auto-trace` do everything: parse → find-tx → generate the `.t.sol` →
-fork at the auto-picked block (`landed_block - 1`, or `oracle_block - 1` if
-the auction never landed) → run `forge test -vvvv` → save the trace and an
-AI-ready prompt.
-
-```bash
-cd atlas-pdata-debugger
-python3 -m atlas_debugger parse <pdata_file> --rpc <RPC_URL> --auto-trace
-```
-
-This produces three files:
-
-| Path | Purpose |
-|---|---|
-| `test/<pdata_name>.t.sol` | The Foundry replay test (with `vm.label` for every known address). |
-| `out/<pdata_name>.trace.log` | Clean (ANSI-stripped) `forge test -vvvv` output. |
-| `out/<pdata_name>.prompt.md` | AI prompt bundling Atlas overview + per-chain config + pData summary + decoded `simResult`/`outcome` + source-code links. |
-
-In Cursor (or any AI chat that accepts file attachments), reference both
-`out/<pdata_name>.prompt.md` and `out/<pdata_name>.trace.log` and the AI has
-all the context it needs to root-cause the failure.
-
-### Mode B — Two-step (manual fork-block control)
-
-Use this when you want to **pick the fork block yourself** — for example to
-sweep blocks around the deadline, replay at a historical block before the
-oracle update, or skip the (sometimes slow) forge run while you only need
-the parsed pData summary.
+Save your `pData.txt` in this directory, then use this manual workflow:
 
 ```bash
 cd atlas-pdata-debugger
 
-# Step 1 — parse only. Prints the pData summary, the recommended fork block
-# at the end, and a ready-to-copy `forge test` command (with --match-path
-# already pointing at the file just generated under test/).
-python3 -m atlas_debugger parse <pdata_file> --rpc <RPC_URL>
+# Step 1 — parse: decode pData basics only.
+# no block lookup is done in this step.
+python3 -m atlas_debugger parse <pdata_file>
 
-# Step 2 — run forge test yourself, choosing whichever fork block you want
-# (the one printed by Step 1, or any other historical block you want to
-# debug at). Replace <RPC_URL> with an archive RPC.
+# Step 2 — sweep: resolves block numbers, generates test/<pdata>.t.sol, then
+# uses eth_call to quickly scan multiple blocks and print
+# PASS/FAIL per block so you can find the boundary.
+python3 -m atlas_debugger sweep <pdata_file> --rpc <RPC_URL>
+
+# If landed metacall is NOT FOUND, you may be querying a dropped auction.
+# In Chainlink SVR, some assets can have duplicate auctions and which one
+# lands cannot be known in advance, so you should submit solverOps for both
+# duplicate auctions.
+
+# Step 3 — pick the block you care about and run full verbose replay.
 forge test --match-path test/<pdata_name>.t.sol \
   --match-test test_replay -vvvv \
   --fork-url <RPC_URL> --fork-block-number <YOUR_BLOCK>
 ```
 
-The Step-2 command is also printed verbatim at the end of Step 1 with the
-recommended block already filled in, so you can copy it and only edit the
-`--fork-block-number` if you want a different block.
+`sweep` block-selection logic:
 
-> **Why `--match-path`?** Each `parse` run drops a new `<pdata_name>.t.sol`
-> into `test/`, so without scoping forge would re-execute every prior replay
-> test in the directory. `--match-path` keeps the run focused on the file
-> you just generated.
+1. If the userOp **landed on-chain**, sweep the **30 blocks before** the landed block (`landed_block - 30` to `landed_block - 1` by default).
+2. If the userOp **did not land**, sweep the range from **oracle timestamp block** to **deadline block**.
 
-> **Mode A vs Mode B.** Mode A is the fastest path to an AI-ready report,
-> but the fork block is auto-picked (`landed_block - 1` if the auction
-> landed on-chain, otherwise `oracle_block - 1`). Mode B is preferred when
-> you want to iterate on the fork block (e.g. sweep blocks around the
-> deadline, or replay at a block before the oracle update), or when forge
-> is too slow / your RPC is flaky and you want to retry the forge step by
-> hand. Mode B does **not** generate `out/*.trace.log` or
-> `out/*.prompt.md`; you can still feed an AI the trace by pasting forge's
-> stdout, but you lose the auto-built prompt context.
+> `--match-path` keeps forge focused on the generated test file so you don't
+> run every old replay file under `test/`.
 
 ## Commands
 
 ### `parse`
 
-The main command. Does **everything** end-to-end:
+Decode-only command. It does:
 
-1. **Decodes the pData hex** offline — UserOp / SolverOp / DAppOp struct fields, deadline, bid, gas params
-2. **Decodes the embedded Chainlink `transmit` report** — `observationsTimestamp`, `rawReportContext`, epoch & round, `rawObservers`, observer indices, signature count, and every `int192` observation (with the median highlighted — this is the value `ChainlinkAtlasWrapper.transmit` writes)
-3. **Recovers the `ChainlinkAtlasWrapper` and underlying base feed** (e.g. which asset's price is being updated), then calls `description()` and `decimals()` on the feed via RPC to show a human-readable pair like `BTC / USD`
-4. **Resolves `observationsTimestamp` to a block number**
-5. **Runs `find-tx`** to locate the on-chain Atlas metacall transaction that actually landed for this pData (filters `MetacallResult` logs by `user = UserOp.from`, then matches `userOpHash` inside the tx calldata — works regardless of which solver won)
-6. **Auto-generates a Foundry replay test** at `landed_block - 1` (or `oracle_block - 1` if no landing tx was found), written to `test/<pdata_name>.t.sol`, ready to run with `forge test -vvvv`. The generated test pre-registers `vm.label(...)` calls for every known address (Atlas, Solver, DAppControl, ChainlinkAtlasWrapper, base feed with its asset pair, etc.) so the verbose trace shows readable names like `[ChainlinkAtlasWrapper]::update(...)` instead of bare `0x…` addresses.
-7. **(opt-in) Auto-runs `forge test -vvvv`** under `--auto-trace`: forks the right archive RPC at the right block, streams forge's output to your terminal, and saves **two** artifacts to `out/`:
-   - `out/<pdata_name>.trace.log` — clean (ANSI-stripped) forge trace.
-   - `out/<pdata_name>.prompt.md` — an AI-ready Markdown prompt that bundles the Atlas protocol overview, the per-chain configuration (explorer URLs and quirks vary by Arbitrum / Base / Ethereum / BSC), the parsed pData summary, the forge result headline, **links to the Atlas source code** on GitHub, and a checklist of concrete questions for the AI to answer.
-
-   In Cursor or any chat-with-attachments AI, drop the prompt file (and the trace) into the conversation and the AI has every layer of context it needs — no manual copy-paste of addresses, enums or protocol explanations.
-
-   The summary at the end distinguishes a real on-chain failure from a flaky-RPC failure (HTTP 5xx, missing trie node, rate limit) so you don't chase a phantom bug.
+1. **Decodes the pData hex** offline — UserOp / SolverOp / DAppOp basic fields.
+2. **Shows oracle basics** (timestamp, wrapper/feed address, epoch/round, signatures, median raw value).
+3. Does **not** perform block lookups or on-chain scans.
 
 ```bash
-python3 -m atlas_debugger parse "sample pData.txt"
+python3 -m atlas_debugger parse "pdataSample.txt"
+```
 
-# Use a custom RPC (recommended: speeds up oracle block + find-tx + feed lookups)
-python3 -m atlas_debugger parse "sample pData.txt" --rpc <RPC_URL>
+### `sweep`
 
-# Auto-run forge test -vvvv after generation; trace saved to
-# out/sample.trace.log, ready to paste into AI alongside the printed summary
-python3 -m atlas_debugger parse "sample pData.txt" --rpc <RPC_URL> --auto-trace
+This command owns the block-finding workflow:
 
-# Skip the on-chain find-tx step (offline-only; no eth_getLogs calls)
-python3 -m atlas_debugger parse "sample pData.txt" --no-find-tx
+1. Resolve oracle timestamp to block (if present).
+2. Find landed metacall tx (if any).
+3. Generate/update `test/<pdata>.t.sol` with the selected fork context.
+4. Run `eth_call` simulation per block and print PASS/FAIL quickly.
 
-# Skip Foundry test generation
-python3 -m atlas_debugger parse "sample pData.txt" --no-generate
+Selection logic:
 
-# Widen the find-tx scan window
-python3 -m atlas_debugger parse "sample pData.txt" --before 20 --after 30
+1. If the userOp landed on-chain: sweep `landed_block - lookback` to `landed_block - 1` (default lookback: 30).
+2. If not landed: sweep `oracle_block` to `deadline`.
+
+```bash
+# Default behavior (lookback=30 when landed)
+python3 -m atlas_debugger sweep "pdataSample.txt" --rpc <RPC_URL>
+
+# Adjust the landed-lookback window
+python3 -m atlas_debugger sweep "pdataSample.txt" --rpc <RPC_URL> --lookback 50
+
+# Add delay between blocks if your RPC is rate-limited
+python3 -m atlas_debugger sweep "pdataSample.txt" --rpc <RPC_URL> --delay 1.0
 ```
 
 ### `find-tx`
@@ -143,13 +106,13 @@ How it works:
 3. Reports the block height, tx hash, bundler, solver success flag and ETH paid.
 
 ```bash
-python3 -m atlas_debugger find-tx "sample pData.txt"
+python3 -m atlas_debugger find-tx "pdataSample.txt"
 
 # Use a custom RPC (must support eth_getLogs over the range; no debug_ required)
-python3 -m atlas_debugger find-tx "sample pData.txt" --rpc <RPC_URL>
+python3 -m atlas_debugger find-tx "pdataSample.txt" --rpc <RPC_URL>
 
 # Widen the scan window
-python3 -m atlas_debugger find-tx "sample pData.txt" --before 20 --after 30
+python3 -m atlas_debugger find-tx "pdataSample.txt" --before 20 --after 30
 ```
 
 Example output:
@@ -165,7 +128,7 @@ Landing Transaction (1 match)
 
 ### `generate`
 
-Standalone Foundry test generator. `parse` already runs this at the end, so you usually don't need to call it directly. Useful when you want a custom output path or have already parsed a pData and just need a fresh `.t.sol`.
+Standalone Foundry test generator. Useful when you want to generate/update `test/<pdata>.t.sol` directly without running `sweep`.
 
 - Output defaults to the project's `test/` directory.
 - Automatically includes Arbitrum precompile mocks (`arbBlockNumber`, `getPricesInArbGas`) when targeting Arbitrum.
@@ -173,9 +136,9 @@ Standalone Foundry test generator. `parse` already runs this at the end, so you 
 - Fork block defaults to `oracle_block` (resolved from the embedded oracle timestamp via RPC) or `deadline - 100` if no oracle timestamp is present. Use `--rpc` to enable the timestamp lookup.
 
 ```bash
-python3 -m atlas_debugger generate "sample pData.txt"
-python3 -m atlas_debugger generate "sample pData.txt" --rpc <RPC_URL>
-python3 -m atlas_debugger generate "sample pData.txt" -o my_test.t.sol
+python3 -m atlas_debugger generate "pdataSample.txt"
+python3 -m atlas_debugger generate "pdataSample.txt" --rpc <RPC_URL>
+python3 -m atlas_debugger generate "pdataSample.txt" -o my_test.t.sol
 ```
 
 ## Supported Chains
@@ -201,14 +164,13 @@ atlas-pdata-debugger/
 ├── foundry.toml              # Foundry config (for generated tests)
 ├── lib/forge-std/            # Forge standard library (used by replay tests)
 ├── test/                     # Generated <pdata>.t.sol files go here
-├── out/                      # Foundry build dir + auto-trace artifacts:
-│                             #   <pdata>.trace.log, <pdata>.prompt.md
+├── out/                      # Foundry build output directory
 ├── pyproject.toml            # Python package metadata
 ├── README.md
 └── atlas_debugger/
     ├── __init__.py
     ├── __main__.py           # python3 -m atlas_debugger entry
-    ├── cli.py                # CLI argument parsing, command dispatch, --auto-trace driver
+    ├── cli.py                # CLI argument parsing and command dispatch
     ├── parser.py             # pData hex → UserOp/SolverOp/DAppOp + OracleReport
     ├── chain.py              # Auto-detect chain from contract addresses
     ├── constants.py          # Chain configs, result codes, known error selectors
@@ -219,5 +181,5 @@ atlas-pdata-debugger/
     ├── tracer.py             # debug_traceCall + CallFrame tree + revert analysis
     ├── foundry_tracer.py     # Fallback tracer using `forge test -vvvv`
     ├── analyzer.py           # Rule-based diagnoses on top of trace results
-    └── report.py             # Builds the AI prompt (out/<pdata>.prompt.md) — chain-aware
+    └── report.py             # AI prompt builder utility (optional)
 ```
