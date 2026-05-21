@@ -1,7 +1,4 @@
 pdata*.txt
-!pdataSample.txt
-__pycache__/
-*.py[cod]
 Explore-logs*
 test/*
 out/build-info/*

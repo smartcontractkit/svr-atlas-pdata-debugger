@@ -59,8 +59,6 @@ def simulate_at_block(
     gas_price: int,
     user_rpc: str | None = None,
     verbose: bool = False,
-    timeout: int = 30,
-    retries_per_rpc: int = 3,
 ) -> SimResult:
     """Run eth_call via cast call, auto-trying multiple archive RPCs."""
     rpcs = get_archive_rpcs(chain, user_rpc)
@@ -74,8 +72,8 @@ def simulate_at_block(
     result = cast_call_multi(
         args=cast_args,
         rpcs=rpcs,
-        retries_per_rpc=max(1, retries_per_rpc),
-        timeout=max(1, timeout),
+        retries_per_rpc=3,
+        timeout=30,
         verbose=verbose,
     )
 

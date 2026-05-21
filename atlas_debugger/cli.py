@@ -6,6 +6,7 @@ import argparse
 import datetime
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -16,7 +17,8 @@ from .constants import RESULT_NAMES, VERIFICATION_FAIL_CODES
 from .find_tx import find_landed_metacall
 from .forge_gen import write_test
 from .foundry_tracer import forge_trace_at_block
-from .parser import parse_pdata
+from .parser import ParsedPData, parse_pdata
+from .report import write_prompt
 from .rpc import describe_feed, find_block_by_timestamp, get_archive_rpcs
 from .simulator import get_current_block, simulate_at_block
 from .tracer import find_deepest_revert, print_call_tree, trace_at_block
@@ -31,22 +33,6 @@ def _print_header(title: str) -> None:
 
 def _print_field(label: str, value: str, indent: int = 2) -> None:
     print(f"{' ' * indent}{label:<22} {value}")
-
-
-def _format_block_targets(start_block: int, end_block: int, preview: int = 40) -> str:
-    """Format target blocks compactly for console output."""
-    if end_block < start_block:
-        return "(none)"
-    total = end_block - start_block + 1
-    if total <= preview:
-        return ", ".join(str(b) for b in range(start_block, end_block + 1))
-
-    head_n = 8
-    tail_n = 8
-    head = ", ".join(str(b) for b in range(start_block, start_block + head_n))
-    tail_start = end_block - tail_n + 1
-    tail = ", ".join(str(b) for b in range(tail_start, end_block + 1))
-    return f"{head}, ..., {tail}"
 
 
 # Regex to strip ANSI color codes from forge output before saving to disk.
@@ -124,76 +110,160 @@ def _summarize_forge_output(plain_text: str) -> dict:
     return info
 
 
-def _run_forge_replay_check(
+def _run_auto_trace(
     *,
     project_root: str,
     match_path: str,
+    fork_block: int,
+    fork_source: str,
     rpc_url: str,
-    block: int,
-    timeout_sec: int,
-) -> dict:
-    """Run one replay test at a specific block and return pass/fail metadata."""
+    base: str,
+    pdata: ParsedPData,
+    chain,
+    feed_description: str | None,
+    pdata_filename: str,
+) -> int:
+    """Invoke `forge test -vvvv` for the freshly generated replay test.
+
+    Streams forge's output to the console live AND captures it (with ANSI
+    codes stripped) into `out/<base>.trace.log` so the user has both an
+    interactive view and a saved artifact. Then renders an AI-ready prompt
+    Markdown file at `out/<base>.prompt.md` that bundles the parsed pData
+    summary, chain-specific context, the forge result headline and pointers
+    to both the trace and the upstream Atlas source code.
+
+    Returns forge's exit code (0 on success, non-zero on test failure or
+    infrastructure error). Note that for `simSolverCall` replays, "test
+    failure" usually means the simulator's `(success, simResult, outcome)`
+    return values indicate a problem — which is precisely what the user is
+    debugging — so the trace artifact is still produced and useful.
+    """
+    if shutil.which("forge") is None:
+        print("  [auto-trace] `forge` not found in PATH. Install Foundry to enable auto-trace:")
+        print("              curl -L https://foundry.paradigm.xyz | bash && foundryup")
+        return 127
+
+    trace_dir = os.path.join(project_root, "out")
+    os.makedirs(trace_dir, exist_ok=True)
+    trace_path = os.path.join(trace_dir, f"{base}.trace.log")
+
     cmd = [
-        "forge",
-        "test",
-        "--match-path",
-        match_path,
-        "--match-test",
-        "test_replay",
-        "--fork-url",
-        rpc_url,
-        "--fork-block-number",
-        str(block),
+        "forge", "test",
+        "--match-path", match_path,
+        "--match-test", "test_replay",
+        "-vvvv",
+        "--fork-url", rpc_url,
+        "--fork-block-number", str(fork_block),
     ]
+
+    rpc_short = rpc_url[:60] + "..." if len(rpc_url) > 60 else rpc_url
+    _print_field("Trace File", os.path.relpath(trace_path, project_root))
+    _print_field("Fork RPC", rpc_short)
+    print()
+    print("  Running: " + " ".join(cmd))
+    print("  (forge test on a forked archive node typically takes 10-60s)")
+    print("-" * 60)
+
     started = time.time()
+    plain_chunks: list[str] = []
     try:
-        proc = subprocess.run(
+        with open(trace_path, "w", encoding="utf-8") as logf, subprocess.Popen(
             cmd,
             cwd=project_root,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=timeout_sec,
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "ok": False,
-            "passed": False,
-            "rpc_issue": False,
-            "reason": f"forge timed out after {timeout_sec}s",
-            "elapsed_s": time.time() - started,
-        }
+            bufsize=1,
+        ) as proc:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                plain = _ANSI_RE.sub("", line)
+                logf.write(plain)
+                plain_chunks.append(plain)
+            proc.wait()
+            exit_code = proc.returncode
+    except KeyboardInterrupt:
+        print("\n  [auto-trace] Interrupted by user.")
+        return 130
     except OSError as e:
-        return {
-            "ok": False,
-            "passed": False,
-            "rpc_issue": False,
-            "reason": f"failed to launch forge: {e}",
-            "elapsed_s": time.time() - started,
-        }
+        print(f"  [auto-trace] Failed to launch forge: {e}")
+        return 1
 
-    plain = _ANSI_RE.sub("", (proc.stdout or "") + "\n" + (proc.stderr or ""))
-    summary = _summarize_forge_output(plain)
+    elapsed = time.time() - started
+    print("-" * 60)
 
-    passed = proc.returncode == 0 and summary.get("forge_status") != "FAIL"
-    reason = summary.get("fail_reason")
-    if not passed and not reason:
-        tail = [line.strip() for line in plain.splitlines() if line.strip()]
-        if tail:
-            reason = tail[-1][:120]
+    captured = "".join(plain_chunks)
+    summary = _summarize_forge_output(captured)
 
-    return {
-        "ok": True,
-        "passed": passed,
-        "rpc_issue": bool(summary.get("rpc_issue")),
-        "reason": reason,
-        "elapsed_s": time.time() - started,
-    }
+    prompt_path: str | None = None
+    try:
+        prompt_path = write_prompt(
+            project_root=project_root,
+            base=base,
+            pdata=pdata,
+            chain=chain,
+            fork_block=fork_block,
+            fork_source=fork_source,
+            feed_description=feed_description,
+            pdata_filename=pdata_filename,
+            trace_path=trace_path,
+            summary=summary,
+        )
+    except Exception as e:
+        print(f"  [auto-trace] WARN: failed to write prompt file: {e}")
+
+    print()
+    _print_header("Auto-Trace Summary")
+    _print_field("Elapsed", f"{elapsed:.1f}s")
+    _print_field("Exit Code", str(exit_code))
+    if summary.get("forge_status"):
+        line = summary["forge_status"]
+        if summary.get("fail_phase"):
+            line += f" in {summary['fail_phase']}()"
+        if summary.get("fail_reason"):
+            reason = summary["fail_reason"]
+            if len(reason) > 120:
+                reason = reason[:120] + "..."
+            line += f" — {reason}"
+        _print_field("forge", line)
+    if summary.get("simResult_decoded"):
+        _print_field("simResult", summary["simResult_decoded"])
+    if summary.get("outcome_decoded"):
+        _print_field("outcome bits", ", ".join(summary["outcome_decoded"]))
+    elif summary.get("outcome"):
+        _print_field("outcome (raw)", summary["outcome"])
+    _print_field("Trace Saved", os.path.relpath(trace_path, project_root))
+    if prompt_path:
+        _print_field("AI Prompt", os.path.relpath(prompt_path, project_root))
+
+    print()
+    if summary.get("rpc_issue") and summary.get("forge_status") != "PASS":
+        print("  Tip: the failure looks like a transient RPC issue (HTTP 5xx,")
+        print("       'missing trie node', or rate-limit). Retry, or pass")
+        print("       `--rpc <YOUR_ARCHIVE_RPC>` for a more reliable endpoint.")
+    elif summary.get("forge_status") == "PASS":
+        print("  Tip: the simulation passed at this fork block. If the on-chain")
+        print("       metacall failed, try a block closer to the deadline.")
+    else:
+        if prompt_path:
+            rel = os.path.relpath(prompt_path, project_root)
+            print(f"  Tip: drop `{rel}` AND the trace log into your AI chat —")
+            print("       the prompt already includes protocol context, chain")
+            print("       config, pData summary, and concrete questions.")
+        else:
+            print("  Tip: paste the saved trace file into an AI chat together with")
+            print("       the pData summary above for fastest root-cause analysis.")
+    return exit_code
 
 
 def cmd_parse(args: argparse.Namespace) -> None:
-    """Parse and print basic decoded pData fields only."""
+    """Parse and display pData fields."""
     pdata = parse_pdata(args.pdata)
     chain = detect_chain(pdata)
+    oracle_block: int | None = None
+    feed_description: str | None = None
 
     _print_header("pData Summary")
     _print_field("Chain", f"{chain.name} ({chain.chain_id})")
@@ -226,13 +296,14 @@ def cmd_parse(args: argparse.Namespace) -> None:
         _print_field("from (EOA)", so.from_addr)
         _print_field("to (Atlas)", so.to_addr)
         _print_field("gas", str(so.gas))
-        _print_field("maxFeePerGas", str(so.max_fee_per_gas))
+        _print_field("maxFeePerGas", f"{so.max_fee_per_gas}")
         _print_field("deadline", str(so.deadline))
         _print_field("solver contract", so.solver)
         _print_field("control", so.control)
         _print_field("userOpHash", so.user_op_hash[:18] + "...")
         _print_field("bidToken", so.bid_token)
-        _print_field("bidAmount", str(so.bid_amount))
+        bid_eth = so.bid_amount / 1e18
+        _print_field("bidAmount", f"{so.bid_amount} ({bid_eth:.10f} ETH)")
         _print_field("data selector", so.data[:10] if len(so.data) > 2 else "(empty)")
         _print_field("data length", f"{(len(so.data) - 2) // 2} bytes")
 
@@ -246,22 +317,81 @@ def cmd_parse(args: argparse.Namespace) -> None:
 
     if pdata.oracle_timestamp or pdata.oracle_report:
         print()
-        _print_header("Oracle Report (basic)")
+        _print_header("Oracle Report (Chainlink transmit)")
         report = pdata.oracle_report
         ts = pdata.oracle_timestamp or (report.timestamp if report else 0)
+
         if ts:
             dt = datetime.datetime.utcfromtimestamp(ts)
             _print_field("Observation Time", f"{dt.isoformat()}Z (unix: {ts})")
+        if pdata.user_op:
+            _print_field("Deadline Block", str(pdata.user_op.deadline))
+
         if report:
-            if report.atlas_wrapper:
-                _print_field("Atlas Wrapper", report.atlas_wrapper)
+            feed_decimals: int | None = None
             if report.base_feed:
-                _print_field("Base Chainlink Feed", report.base_feed)
+                print("  Resolving base feed description via RPC...")
+                info = describe_feed(report.base_feed, chain, getattr(args, "rpc", None))
+                feed_description = info.get("description")
+                feed_decimals = info.get("decimals")
+
+            if report.atlas_wrapper:
+                _print_field("Atlas Wrapper", f"{report.atlas_wrapper}  [stores OEV price]")
+            if report.base_feed:
+                label = report.base_feed
+                if feed_description:
+                    label += f"  [{feed_description}]"
+                _print_field("Base Chainlink Feed", label)
+            if feed_decimals is not None:
+                _print_field("Feed Decimals", str(feed_decimals))
+
+            _print_field("Raw Report Context", report.raw_report_context)
             _print_field("Epoch & Round", str(report.epoch_and_round))
+            _print_field("Raw Observers", report.raw_observers)
+            if report.observer_indices:
+                idx_str = ",".join(str(i) for i in report.observer_indices)
+                _print_field("Observer Indices", f"[{idx_str}] ({len(report.observer_indices)} oracles)")
             if report.num_signatures is not None:
                 _print_field("Signatures", str(report.num_signatures))
-            if report.median is not None:
-                _print_field("Median (raw int192)", str(report.median))
+            if report.observations:
+                _print_field("Num Observations", str(len(report.observations)))
+                if report.median is not None:
+                    med = report.median
+                    med_line = f"{med}"
+                    if feed_decimals is not None:
+                        med_line += f"  ({feed_decimals} dec: {med / (10 ** feed_decimals):.{feed_decimals}f})"
+                    else:
+                        med_line += f"  (8 dec: {med / 1e8:.8f}, 18 dec: {med / 1e18:.10f})"
+                    _print_field("Median (raw int192)", med_line)
+                print()
+                print("  Observations (sorted ascending by Chainlink; in raw int192):")
+                for i, obs in enumerate(report.observations):
+                    marker = "  <- median" if i == len(report.observations) // 2 else ""
+                    if feed_decimals is not None:
+                        scaled = f"{feed_decimals}d: {obs / (10 ** feed_decimals):.{feed_decimals}f}"
+                    else:
+                        scaled = f"8d: {obs / 1e8:.6f}, 18d: {obs / 1e18:.8f}"
+                    print(f"    [{i:2d}] {obs}  ({scaled}){marker}")
+
+        if not ts:
+            ts = 0
+        if ts:
+            print()
+            print("  Finding the block for this timestamp...")
+            oracle_block = find_block_by_timestamp(ts, chain, getattr(args, "rpc", None))
+        else:
+            oracle_block = None
+        if oracle_block:
+            deadline = pdata.user_op.deadline if pdata.user_op else 0
+            gap = deadline - oracle_block
+            _print_field("Oracle Block", str(oracle_block))
+            _print_field("Gap to Deadline", f"{gap} blocks (~{gap * chain.block_time_sec:.0f}s)")
+            print()
+            print(f"  Recommended simulation block: {oracle_block}")
+            print(f"  Usage: python3 -m atlas_debugger simulate <pdata> --block {oracle_block}")
+        else:
+            print("  Could not resolve block (RPC unavailable).")
+            print(f"  You can run: cast find-block {ts} --rpc-url <rpc>")
 
     if pdata.errors:
         print()
@@ -269,9 +399,84 @@ def cmd_parse(args: argparse.Namespace) -> None:
         for err in pdata.errors:
             print(f"    - {err}")
 
-    print()
-    print("  Next step:")
-    print(f'    python3 -m atlas_debugger sweep "{args.pdata}" --rpc <RPC_URL>')
+    landing_block: int | None = None
+    if not getattr(args, "no_find_tx", False):
+        if pdata.user_op and pdata.solver_op:
+            print()
+            _print_header("Find Landed Metacall Tx")
+            winners = _run_find_tx(
+                pdata,
+                chain,
+                user_rpc=getattr(args, "rpc", None),
+                before=getattr(args, "before", 5),
+                after=getattr(args, "after", 5),
+                oracle_block=oracle_block if pdata.oracle_timestamp else None,
+                show_header_fields=False,
+            )
+            if winners:
+                landing_block = winners[0].block_number
+
+    if not getattr(args, "no_generate", False) and pdata.user_op:
+        print()
+        _print_header("Generate Foundry Replay Test")
+        if landing_block is not None:
+            fork_block = landing_block - 1
+            fork_source = f"landed metacall block {landing_block} - 1"
+        elif oracle_block is not None:
+            fork_block = oracle_block - 1
+            fork_source = f"oracle block {oracle_block} - 1 (no landing tx found)"
+        else:
+            deadline = pdata.user_op.deadline
+            fork_block = deadline - 100
+            fork_source = f"deadline ({deadline}) - 100 (no oracle, no landing tx)"
+
+        base = os.path.splitext(os.path.basename(args.pdata))[0]
+        project_root = _project_root()
+        test_dir = os.path.join(project_root, "test")
+        output_path = os.path.join(test_dir, f"{base}.t.sol")
+
+        path = write_test(
+            pdata=pdata,
+            chain=chain,
+            oracle_block=oracle_block,
+            output_path=output_path,
+            source_file=args.pdata,
+            fork_block=fork_block,
+            feed_description=feed_description,
+        )
+
+        rpc_hint = getattr(args, "rpc", None) or (chain.rpcs[0] if chain.rpcs else "<RPC_URL>")
+        match_path = os.path.relpath(path, project_root)
+        _print_field("Output", os.path.relpath(path))
+        _print_field("Fork Block", f"{fork_block}  ({fork_source})")
+        print()
+        print("  Run with:")
+        print(f"    cd {project_root}")
+        print(f"    forge test --match-path {match_path} --match-test test_replay -vvvv \\")
+        print(f"      --fork-url {rpc_hint} \\")
+        print(f"      --fork-block-number {fork_block}")
+
+        if getattr(args, "auto_trace", False):
+            print()
+            _print_header("Auto-Trace (forge test -vvvv)")
+            # Prefer the user-provided --rpc for forking. Otherwise fall back
+            # to the first archive RPC (drpc.org-class), which is needed for
+            # historical-block forks; chain.rpcs[0] is often the public RPC
+            # without archive state and would fail with "missing trie node".
+            user_rpc = getattr(args, "rpc", None)
+            fork_rpc = user_rpc or get_archive_rpcs(chain, None)[0]
+            _run_auto_trace(
+                project_root=project_root,
+                match_path=match_path,
+                fork_block=fork_block,
+                fork_source=fork_source,
+                rpc_url=fork_rpc,
+                base=base,
+                pdata=pdata,
+                chain=chain,
+                feed_description=feed_description,
+                pdata_filename=args.pdata,
+            )
 
 
 def _resolve_block(pdata, chain, args) -> tuple[int, str]:
@@ -401,198 +606,63 @@ def cmd_simulate(args: argparse.Namespace) -> None:
 
 
 def cmd_sweep(args: argparse.Namespace) -> None:
-    """Find block ranges and sweep pass/fail quickly via eth_call."""
+    """Sweep a range of blocks to find the exact pass/fail boundary."""
     pdata = parse_pdata(args.pdata)
     chain = detect_chain(pdata)
+    simulator = pdata.simulator or chain.simulator
 
     if not pdata.user_op:
         print("ERROR: Failed to decode UserOperation")
         sys.exit(1)
 
-    simulator = pdata.simulator or chain.simulator
     deadline = pdata.user_op.deadline
     gas_price = pdata.gas_fee_cap or pdata.user_op.max_fee_per_gas
-    base = os.path.splitext(os.path.basename(args.pdata))[0]
-    project_root = _project_root()
-    test_dir = os.path.join(project_root, "test")
-    test_path = os.path.join(project_root, "test", f"{base}.t.sol")
-    rpc_candidates = get_archive_rpcs(chain, args.rpc)
-    rpc_url = rpc_candidates[0] if rpc_candidates else (args.rpc or (chain.rpcs[0] if chain.rpcs else ""))
-    if not rpc_url:
-        print("ERROR: No RPC endpoint available. Pass --rpc <ARCHIVE_RPC_URL>.")
-        sys.exit(1)
 
-    print()
-    _print_header("Sweep Precheck")
-    print("  Looking for landed metacall...")
+    start_offset = args.start or 100
+    end_offset = args.end or 90
 
-    oracle_block = None
-    if pdata.oracle_timestamp:
-        oracle_block = find_block_by_timestamp(pdata.oracle_timestamp, chain, args.rpc)
-
-    winners = []
-    if pdata.solver_op:
-        winners, _ = find_landed_metacall(
-            pdata,
-            chain,
-            user_rpc=args.rpc,
-            block_window_after_deadline=args.after,
-            block_window_before_oracle=args.before,
-            verbose=False,
-            oracle_block=oracle_block,
-        )
-
-    landed_yes = bool(winners)
-    _print_field("Landed Metacall", "FOUND" if landed_yes else "NOT FOUND")
-    if landed_yes:
-        _print_field("Landed Block", str(winners[0].block_number))
-        _print_field("Landed Tx", winners[0].tx_hash)
-
-    ts = pdata.oracle_timestamp
-    if ts:
-        dt = datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S UTC")
-        _print_field("Oracle Timestamp", f"{ts} ({dt})")
-    else:
-        _print_field("Oracle Timestamp", "(none)")
-    _print_field("Timestamp Block", str(oracle_block) if oracle_block is not None else "(unresolved)")
-
-    feed_description: str | None = None
-    if pdata.oracle_report and pdata.oracle_report.base_feed:
-        info = describe_feed(pdata.oracle_report.base_feed, chain, args.rpc)
-        feed_description = info.get("description")
-
-    if winners:
-        landed_block = winners[0].block_number
-        fork_block = landed_block - 1
-        fork_source = f"landed metacall block {landed_block} - 1"
-    elif oracle_block is not None:
-        fork_block = oracle_block - 1
-        fork_source = f"oracle block {oracle_block} - 1 (no landing tx found)"
-    else:
-        fork_block = deadline - 100
-        fork_source = f"deadline ({deadline}) - 100 (no oracle, no landing tx)"
-
-    # sweep owns block-finding and replay-test generation.
-    os.makedirs(test_dir, exist_ok=True)
-    path = write_test(
-        pdata=pdata,
-        chain=chain,
-        oracle_block=oracle_block,
-        output_path=test_path,
-        source_file=args.pdata,
-        fork_block=fork_block,
-        feed_description=feed_description,
-    )
-    match_path = os.path.relpath(path, project_root)
-
-    if winners:
-        landed_block = winners[0].block_number
-        end_block = landed_block - 1
-        start_block = max(0, end_block - max(args.lookback, 1) + 1)
-        mode = f"userOp landed at block {landed_block}; sweeping previous {end_block - start_block + 1} blocks"
-    elif oracle_block is not None:
-        start_block = oracle_block
-        end_block = deadline
-        mode = f"userOp not found on-chain; sweeping oracle block -> deadline ({oracle_block}..{deadline})"
-    else:
-        end_block = deadline
-        start_block = max(0, end_block - max(args.lookback, 1) + 1)
-        mode = (
-            "userOp not found and oracle timestamp unavailable; "
-            f"fallback to deadline lookback ({start_block}..{end_block})"
-        )
-
-    if end_block < start_block:
-        print("ERROR: invalid sweep block range.")
-        sys.exit(1)
-
-    total_blocks = end_block - start_block + 1
-    _print_field("Blocks To Test", f"{start_block} .. {end_block} ({total_blocks} blocks)")
-    _print_field("Block Targets", _format_block_targets(start_block, end_block))
-    print()
-
-    _print_header("Sweep (eth_call)")
+    _print_header(f"Block Sweep: deadline-{start_offset} to deadline-{end_offset}")
     _print_field("Chain", chain.name)
-    _print_field("Replay Test", os.path.relpath(path, project_root))
-    _print_field("Generated Fork Block", f"{fork_block} ({fork_source})")
-    _print_field("Mode", mode)
-    _print_field("Block Range", f"{start_block} .. {end_block} ({total_blocks} blocks)")
-    _print_field("Engine", "eth_call simSolverCall")
-    _print_field("Fork RPC", rpc_url[:80] + ("..." if len(rpc_url) > 80 else ""))
+    _print_field("Deadline", str(deadline))
     print()
 
-    prev_passed: bool | None = None
-    passes: list[int] = []
-    fails: list[int] = []
-    boundaries: list[int] = []
+    prev_passed = None
+    boundary_block = None
 
-    for idx, block in enumerate(range(start_block, end_block + 1), start=1):
-        started = time.time()
-        sim_result = simulate_at_block(
+    for offset in range(start_offset, end_offset - 1, -1):
+        block = deadline - offset
+        result = simulate_at_block(
             calldata=pdata.calldata,
             simulator=simulator,
             chain=chain,
             block=block,
             gas_price=gas_price,
             user_rpc=args.rpc,
-            timeout=args.timeout,
-            retries_per_rpc=3,
-            verbose=False,
         )
-        elapsed_s = time.time() - started
-        passed = bool(sim_result.passed)
-        status = "PASS" if passed else "FAIL"
-        if sim_result.error:
-            status += " (RPC?)"
 
+        status = "PASS" if result.passed else "FAIL"
         marker = ""
-        if prev_passed is not None and prev_passed != passed:
+        if prev_passed is not None and prev_passed and not result.passed:
             marker = " <-- BOUNDARY"
-            boundaries.append(block)
+            boundary_block = block
 
-        reason_short = ""
-        if sim_result.error:
-            reason_short = sim_result.error[:120]
-        elif not passed:
-            bits = ", ".join(sim_result.outcome_bits) if sim_result.outcome_bits else "none"
-            reason_short = (
-                f"{sim_result.result_name}, outcome={sim_result.outcome}, bits=[{bits}]"
-            )
+        rpc_hint = ""
+        if result.rpc_used:
+            rpc_short = result.rpc_used.split("//")[-1].split("/")[0][:20]
+            rpc_hint = f" [{rpc_short}]"
 
-        line = (
-            f"  [{idx}/{total_blocks}] Block {block}: {status}{marker}  [{elapsed_s:.1f}s]"
-        )
-        if reason_short:
-            line += f" | {reason_short}"
-        print(line)
+        print(f"  Block {block} (dl-{offset:>3}): {result.result_name:<25} {status}{marker}{rpc_hint}")
 
-        if passed:
-            passes.append(block)
-        else:
-            fails.append(block)
-        prev_passed = passed
+        if result.error:
+            print(f"         Error: {result.error[:70]}")
 
-        if args.delay > 0 and block < end_block:
-            time.sleep(args.delay)
+        prev_passed = result.passed
+        time.sleep(args.delay or 1.5)
 
-    print()
-    _print_header("Sweep Summary")
-    _print_field("PASS", str(len(passes)))
-    _print_field("FAIL", str(len(fails)))
-    if passes:
-        _print_field("First PASS", str(passes[0]))
-        _print_field("Last PASS", str(passes[-1]))
-    if fails:
-        _print_field("First FAIL", str(fails[0]))
-        _print_field("Last FAIL", str(fails[-1]))
-    if boundaries:
-        _print_field("Boundary Blocks", ", ".join(str(b) for b in boundaries))
-    print()
-    print("  Run full trace on a chosen block with:")
-    print(f"    cd {project_root}")
-    print(f"    forge test --match-path {match_path} --match-test test_replay -vvvv \\")
-    print(f"      --fork-url {rpc_url} \\")
-    print("      --fork-block-number <YOUR_BLOCK>")
+    if boundary_block:
+        print()
+        print(f"  Exact boundary: block {boundary_block} (first failure)")
+        print(f"  Last passing:   block {boundary_block - 1}")
 
 
 def cmd_trace(args: argparse.Namespace) -> None:
@@ -898,8 +968,28 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # parse
-    p_parse = subparsers.add_parser("parse", help="Parse and display basic decoded pData fields")
+    p_parse = subparsers.add_parser("parse", help="Parse and display pData fields")
     p_parse.add_argument("pdata", help="Path to pData file")
+    p_parse.add_argument("--rpc", help="Custom RPC URL (optional, used for oracle timestamp -> block resolution and find-tx)")
+    p_parse.add_argument(
+        "--no-find-tx", action="store_true",
+        help="Skip the on-chain landed-metacall-tx lookup at the end (faster, no eth_getLogs calls)",
+    )
+    p_parse.add_argument(
+        "--no-generate", action="store_true",
+        help="Skip auto-generating the Foundry replay test at the end",
+    )
+    p_parse.add_argument(
+        "--auto-trace", action="store_true",
+        help=(
+            "After generating the test file, immediately invoke `forge test -vvvv` "
+            "with the right --fork-url/--fork-block-number/--match-path. Streams "
+            "output to the console and saves a clean copy to out/<pdata>.trace.log "
+            "ready to paste into AI for diagnosis."
+        ),
+    )
+    p_parse.add_argument("--before", type=int, default=5, help="find-tx: extra blocks before oracle block (default: 5)")
+    p_parse.add_argument("--after", type=int, default=5, help="find-tx: extra blocks after deadline (default: 5)")
 
     # simulate
     p_sim = subparsers.add_parser("simulate", help="Simulate pData at a specific block")
@@ -909,14 +999,12 @@ def main() -> None:
     p_sim.add_argument("--offset", type=int, default=100, help="Blocks before deadline (default: 100)")
 
     # sweep
-    p_sweep = subparsers.add_parser("sweep", help="Sweep pass/fail across blocks using eth_call (fast) and generate test/<pdata>.t.sol")
+    p_sweep = subparsers.add_parser("sweep", help="Sweep blocks to find pass/fail boundary")
     p_sweep.add_argument("pdata", help="Path to pData file")
     p_sweep.add_argument("--rpc", help="Custom RPC URL (optional)")
-    p_sweep.add_argument("--lookback", type=int, default=30, help="When landed tx exists, scan this many blocks before it (default: 30)")
-    p_sweep.add_argument("--before", type=int, default=5, help="find-tx: extra blocks before oracle block (default: 5)")
-    p_sweep.add_argument("--after", type=int, default=5, help="find-tx: extra blocks after deadline (default: 5)")
-    p_sweep.add_argument("--delay", type=float, default=0.0, help="Delay between per-block checks in seconds")
-    p_sweep.add_argument("--timeout", type=int, default=30, help="Timeout (seconds) for each per-block eth_call")
+    p_sweep.add_argument("--start", type=int, default=100, help="Start offset from deadline (default: 100)")
+    p_sweep.add_argument("--end", type=int, default=90, help="End offset from deadline (default: 90)")
+    p_sweep.add_argument("--delay", type=float, default=1.5, help="Delay between RPC calls in seconds")
 
     # trace
     p_trace = subparsers.add_parser("trace", help="Trace execution and auto-analyze revert reason")
