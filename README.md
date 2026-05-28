@@ -6,8 +6,6 @@ A CLI tool to help Atlas protocol searchers diagnose `simSolverCall` simulation 
 
 Given a pData hex file, this tool can:
 - **Parse** basic decoded fields (UserOp / SolverOp / DAppOp / Oracle basics) with no RPC-dependent block lookup.
-- **Find the on-chain landed metacall tx** for the auction (works even when a different solver won the bid).
-- **Generate** a standalone Foundry test (`test/<pdata_name>.t.sol`) at the right fork block, with all known addresses pre-labeled via `vm.label`.
 - **Sweep execution across blocks** (in `sweep`) to find pass/fail boundaries before choosing a detailed replay block.
 
 ## Requirements
@@ -43,18 +41,18 @@ python3 -m atlas_debugger sweep <pdata_file> --rpc <RPC_URL>
 # duplicate auctions.
 
 # Step 3 — pick the block you care about and run full verbose replay.
+# Recommended: save output to a log file for later analysis/sharing.
+mkdir -p logs
 forge test --match-path test/<pdata_name>.t.sol \
   --match-test test_replay -vvvv \
-  --fork-url <RPC_URL> --fork-block-number <YOUR_BLOCK>
+  --fork-url <RPC_URL> --fork-block-number <YOUR_BLOCK> \
+  > logs/replay_<pdata_name>_<YOUR_BLOCK>.log 2>&1
+
+# Step 4 — ask AI to analyze the log and identify the revert root cause.
+# In Cursor, open logs/replay_<pdata_name>_<YOUR_BLOCK>.log and ask:
+# "Please analyze this Forge replay log and tell me the exact revert reason,
+# the failing call path, and suggested fixes."
 ```
-
-`sweep` block-selection logic:
-
-1. If the userOp **landed on-chain**, sweep the **30 blocks before** the landed block (`landed_block - 30` to `landed_block - 1` by default).
-2. If the userOp **did not land**, sweep the range from **oracle timestamp block** to **deadline block**.
-
-> `--match-path` keeps forge focused on the generated test file so you don't
-> run every old replay file under `test/`.
 
 ## Commands
 
@@ -63,26 +61,80 @@ forge test --match-path test/<pdata_name>.t.sol \
 Decode-only command. It does:
 
 1. **Decodes the pData hex** offline — UserOp / SolverOp / DAppOp basic fields.
-2. **Shows oracle basics** (timestamp, wrapper/feed address, epoch/round, signatures, median raw value).
+2. **Shows oracle basics** (network chainId, timestamp, wrapper/feed address, epoch/round, signatures, data feed address, median raw value).
 3. Does **not** perform block lookups or on-chain scans.
+4. See the sample result below:
+```
+============================================================
+  pData Summary
+============================================================
+  Chain                  Arbitrum (42161)
+  Simulator              0x57FA2aBf1dc109C5F7ea2FB6A72358D2c624971d
+  Calldata Size          4964 bytes
 
-```bash
-python3 -m atlas_debugger parse "pdataSample.txt"
+============================================================
+  UserOperation
+============================================================
+  from                   0xb6065f79d99f29c3eda0ed1bda7ff88e7ee12f1e
+  to (Atlas)             0x8ad1ae9d97c79aa68a0a151e83ff3942f68f86c1
+  gas                    500000
+  maxFeePerGas           30039000 (0.0300 Gwei)
+  deadline               459535529
+  dapp                   0xe15bba987c002ecc3586e81244517877d294d291
+  control                0xe15bba987c002ecc3586e81244517877d294d291
+  callConfig             41732
+  data selector          0x02a688ed
+  data length            1316 bytes
+
+============================================================
+  SolverOperation
+============================================================
+  from (EOA)             0x00003f87cef82f2a4120118a962d956eccfb3cfd
+  to (Atlas)             0x8ad1ae9d97c79aa68a0a151e83ff3942f68f86c1
+  gas                    6000000
+  maxFeePerGas           30039000
+  deadline               459535529
+  solver contract        0x0e0d47c29cba6dcdbb345bd33e926e6776e4c9ca
+  control                0xe15bba987c002ecc3586e81244517877d294d291
+  userOpHash             0x170e42536a805779...
+  bidToken               0x0000000000000000000000000000000000000000
+  bidAmount              82680795878240838
+  data selector          0x00000000
+  data length            1952 bytes
+
+============================================================
+  DAppOperation
+============================================================
+  bundler                0x9d8a4c00835bfb7bd967c91959a9d21603375140
+  deadline               459535529
+  userOpHash             0x170e42536a805779...
+
+============================================================
+  Oracle Report (basic)
+============================================================
+  Observation Time       2026-05-05T05:25:05Z (unix: 1777958705)
+  Atlas Wrapper          0x9cd5b3e0777b3c85803e6c54c48f905315b9bbe6
+  Base Chainlink Feed    0xe7c522c60ba7f1b5e398d2312593713e2b19aeb0
+  Epoch & Round          1777958705
+  Signatures             4
+  Median (raw int192)    8117564124522
+
+  Next step:
+    python3 -m atlas_debugger sweep "pdataSample.txt" --rpc <RPC_URL>
 ```
 
-### `sweep`
+Try command `python3 -m atlas_debugger parse "pdataSample.txt"` to see the result above. 
 
-This command owns the block-finding workflow:
+### `sweep`
+This command owns the block-finding workflow and help you to find the right block number to simulate. 
+**Notice**: A userOp does not always land on-chain for multiple reasons: 1) Some assets have duplicate auctions, and it is impossible to know in advance which one will land. If you bid on the losing auction, the solverOp cannot be included on-chain. 2) If an auction does not receive enough valid bids from searchers, none of the userOps in that round can be included on-chain.
+**Notice**: The block containing the landed metacall is not always the same block where searcher solverOps were simulated. There can be a gap between the block where Atlas simulated and the block where the metacall landed. This is why a pData may simulate successfully at the landed block but still revert in Atlas. For this reason, the debugger starts simulation from 30 blocks before the landed block.
 
 1. Resolve oracle timestamp to block (if present).
-2. Find landed metacall tx (if any).
+2. Find landed metacall tx (if any). If the userOp landed on-chain: sweep `landed_block - lookback` to `landed_block - 1` (default lookback: 30). If not landed: sweep `oracle_block` to `deadline`.
 3. Generate/update `test/<pdata>.t.sol` with the selected fork context.
 4. Run `eth_call` simulation per block and print PASS/FAIL quickly.
 
-Selection logic:
-
-1. If the userOp landed on-chain: sweep `landed_block - lookback` to `landed_block - 1` (default lookback: 30).
-2. If not landed: sweep `oracle_block` to `deadline`.
 
 ```bash
 # Default behavior (lookback=30 when landed)
@@ -93,52 +145,6 @@ python3 -m atlas_debugger sweep "pdataSample.txt" --rpc <RPC_URL> --lookback 50
 
 # Add delay between blocks if your RPC is rate-limited
 python3 -m atlas_debugger sweep "pdataSample.txt" --rpc <RPC_URL> --delay 1.0
-```
-
-### `find-tx`
-
-Locates the **on-chain Atlas `metacall` transaction** that actually landed for a given pData — even if a different solver won the auction.
-
-How it works:
-
-1. Filters `MetacallResult(bundler, user, …)` logs on the Atlas contract (`= UserOp.to`), indexed by `user = UserOp.from`, across the block range `[oracle_block − before, deadline + after]`.
-2. For each candidate, fetches the tx calldata and matches our `userOpHash` inside it (since the userOp/dAppOp in the metacall calldata contains the same hash).
-3. Reports the block height, tx hash, bundler, solver success flag and ETH paid.
-
-```bash
-python3 -m atlas_debugger find-tx "pdataSample.txt"
-
-# Use a custom RPC (must support eth_getLogs over the range; no debug_ required)
-python3 -m atlas_debugger find-tx "pdataSample.txt" --rpc <RPC_URL>
-
-# Widen the scan window
-python3 -m atlas_debugger find-tx "pdataSample.txt" --before 20 --after 30
-```
-
-Example output:
-
-```
-Landing Transaction (1 match)
-  Block                  448889822
-  Tx Hash                0xd6acc1cd85f3926bc8ae5ec5eef80c82a8fb33fbdbeec05d1542217625c21be7
-  Bundler                0xbdaf054a42a32e7fbc4ef094f6121b8a84410d92
-  Solver Successful      True
-  ETH Paid to Bundler    7860696844000 wei (0.0000078607 ETH)
-```
-
-### `generate`
-
-Standalone Foundry test generator. Useful when you want to generate/update `test/<pdata>.t.sol` directly without running `sweep`.
-
-- Output defaults to the project's `test/` directory.
-- Automatically includes Arbitrum precompile mocks (`arbBlockNumber`, `getPricesInArbGas`) when targeting Arbitrum.
-- Embeds the correct `vm.txGasPrice`, simulator address, and `vm.label(...)` calls for every known address.
-- Fork block defaults to `oracle_block` (resolved from the embedded oracle timestamp via RPC) or `deadline - 100` if no oracle timestamp is present. Use `--rpc` to enable the timestamp lookup.
-
-```bash
-python3 -m atlas_debugger generate "pdataSample.txt"
-python3 -m atlas_debugger generate "pdataSample.txt" --rpc <RPC_URL>
-python3 -m atlas_debugger generate "pdataSample.txt" -o my_test.t.sol
 ```
 
 ## Supported Chains
