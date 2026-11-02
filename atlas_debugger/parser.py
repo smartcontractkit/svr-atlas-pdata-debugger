@@ -180,8 +180,14 @@ def _extract_bytes_field(words: list[str], struct_offset: int, field_idx: int) -
         length = _uint(_word(words, data_start))
         if length == 0:
             return "0x"
-        hex_data = ""
         n_words = (length + 31) // 32
+        # Sanity check: the bytes field must fit within the available words.
+        # With truncated/garbage calldata, a misaligned pointer can make
+        # `length` an astronomical number (e.g. an address word), which would
+        # otherwise send the loop below into an effectively infinite spin.
+        if data_start < 0 or data_start + 1 + n_words > len(words):
+            return "0x"
+        hex_data = ""
         for i in range(data_start + 1, data_start + 1 + n_words):
             hex_data += _word(words, i)
         return "0x" + hex_data[: length * 2]
@@ -230,18 +236,24 @@ def _extract_hex_from_text(content: str) -> tuple[str, dict]:
     except (json.JSONDecodeError, TypeError):
         pass
 
+    # The pData hex may be wrapped across many lines. Collapse all whitespace
+    # before matching so multi-line hex is extracted in full rather than being
+    # truncated at the first newline (which previously caused garbage ABI
+    # decoding downstream).
+    collapsed = re.sub(r"\s+", "", content)
+
     # Extract pData hex: look for "pData <hex>," pattern
-    m = re.search(r'pData\s+([0-9a-fA-F]{100,})', content)
+    m = re.search(r'pData([0-9a-fA-F]{100,})', collapsed)
     if m:
         return m.group(1), metadata
 
     # Fallback: look for simSolverCall selector b759598a
-    m = re.search(r'(b759598a[0-9a-fA-F]{100,})', content)
+    m = re.search(r'(b759598a[0-9a-fA-F]{100,})', collapsed)
     if m:
         return m.group(1), metadata
 
     # Last resort: find the longest hex string
-    hexes = re.findall(r'[0-9a-fA-F]{200,}', content)
+    hexes = re.findall(r'[0-9a-fA-F]{200,}', collapsed)
     if hexes:
         longest = max(hexes, key=len)
         return longest, metadata

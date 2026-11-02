@@ -135,22 +135,45 @@ def eth_get_logs(
     """
     rpcs = get_archive_rpcs(chain, user_rpc)
     topics_encoded: list[str | None] = list(topics) if topics else []
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_getLogs",
-        "params": [
-            {
-                "address": address,
-                "fromBlock": hex(from_block),
-                "toBlock": hex(to_block),
-                "topics": topics_encoded,
-            }
-        ],
-    }
-    ok, result, _rpc_used, err = curl_post_multi(payload, rpcs, retries_per_rpc=2, timeout=60)
-    if ok and isinstance(result, list):
-        return True, result, ""
+
+    def _query(b0: int, b1: int) -> tuple[bool, list[dict], str]:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getLogs",
+            "params": [
+                {
+                    "address": address,
+                    "fromBlock": hex(b0),
+                    "toBlock": hex(b1),
+                    "topics": topics_encoded,
+                }
+            ],
+        }
+        ok, result, _rpc_used, err = curl_post_multi(payload, rpcs, retries_per_rpc=2, timeout=60)
+        if ok and isinstance(result, list):
+            return True, result, ""
+        return False, [], err
+
+    ok, logs, err = _query(from_block, to_block)
+    if ok:
+        return True, logs, ""
+
+    # Some providers (e.g. Alchemy free tier) reject eth_getLogs over wide
+    # block ranges. Fall back to 10-block chunks, which the strictest common
+    # free tiers allow.
+    if to_block - from_block > 10:
+        all_logs: list[dict] = []
+        b = from_block
+        while b <= to_block:
+            e = min(b + 9, to_block)
+            ok_c, logs_c, err_c = _query(b, e)
+            if not ok_c:
+                return False, [], f"chunked getLogs failed at {b}-{e}: {err_c}"
+            all_logs.extend(logs_c)
+            b = e + 1
+        return True, all_logs, ""
+
     return False, [], err
 
 
