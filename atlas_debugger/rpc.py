@@ -37,6 +37,10 @@ ARCHIVE_RPCS: dict[int, list[str]] = {
         "https://rpc.ankr.com/eth",
         "https://ethereum-rpc.publicnode.com",
     ],
+    57073: [  # Ink
+        "https://ink.drpc.org",
+        "https://rpc-gel.inkonchain.com",
+    ],
 }
 
 
