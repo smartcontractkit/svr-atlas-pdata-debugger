@@ -48,6 +48,14 @@ CHAINS: dict[str, ChainConfig] = {
         simulator="0x1244E84965e3F4b3e282c2f180b399dB17948f83",
         block_time_sec=12.0,
     ),
+    "ink": ChainConfig(
+        name="Ink",
+        chain_id=57073,
+        rpcs=["https://rpc-gel.inkonchain.com", "https://ink.drpc.org"],
+        atlas="0x3efbabe0ee916a4677d281c417e895a3e7411ac2",
+        simulator="0xa55051bd82eFeA1dD487875C84fE9c016859659B",
+        block_time_sec=1.0,
+    ),
 }
 
 RESULT_NAMES = {

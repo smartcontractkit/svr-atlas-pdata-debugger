@@ -155,13 +155,20 @@ python3 -m atlas_debugger sweep "pdataSample.txt" --rpc <RPC_URL> --delay 1.0
 | BSC      | 56       | Yes           | No                   |
 | Base     | 8453     | Yes           | No                   |
 | Arbitrum | 42161    | Yes           | Yes                  |
+| Ink      | 57073    | Yes           | No                   |
 
 ## pData File Format
 
 The tool accepts files containing the pData hex in several formats:
-- Raw hex starting with `b759598a` (the `simSolverCall` selector)
+- **Raw hex only** — a file containing just the pData hex starting with `b759598a` (the `simSolverCall` selector). No JSON wrapper, log line, or `pData` prefix is required; extra metadata (auctionId, solverFrom, result text) only affects display info, not analysis.
 - Sorter debug log lines containing `pData <hex>`
 - JSON with the pData embedded
+
+Requirements for the hex:
+- Must be complete (real pData is typically thousands of hex chars; the extractor needs at least 100).
+- Must be one continuous string — do not insert line breaks inside the hex, or extraction will fail/produce a truncated value.
+
+> ⚠️ **Warning:** Make sure the pData hex is correct and complete before running the debugger. If the pData is malformed, truncated, or corrupted, the debugger may hang/freeze instead of failing fast. If a command appears stuck, verify your pData file first.
 
 ## Architecture
 

@@ -86,6 +86,17 @@ _CHAIN_PROMPT_CONTEXT: dict[int, ChainPromptContext] = {
             "BNB, not ETH.",
         ),
     ),
+    57073: ChainPromptContext(
+        explorer_url="https://explorer.inkonchain.com",
+        native_symbol="ETH",
+        wrapped_native_addr="0x4200000000000000000000000000000000000006",
+        wrapped_native_label="WETH",
+        notes=(
+            "Ink is an OP Stack L2 with ~1-second blocks. The wrapped native "
+            "asset is WETH at the standard OP Stack predeploy address "
+            "`0x4200000000000000000000000000000000000006`.",
+        ),
+    ),
 }
 
 
